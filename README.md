@@ -3,7 +3,7 @@
 > 一块无限画布，一条从创意到成片的完整流水线。
 > 类 LibTV 的无限画布视频创作工作台：手动节点工作流与 Agent 一句话成片双模式并存，文本、图像、视频生成全部由 Muse 驱动，使用者不需要任何 API Key。
 
-![Muse InfiniteReel](docs/screenshots/canvas-overview.png)
+![Muse InfiniteReel](docs/screenshots/canvas-overview.jpg)
 
 ---
 
@@ -74,13 +74,13 @@ Muse InfiniteReel 是一个运行在 Muse 托管运行时上的全栈 Web 应用
 
 > 截图为工具在 Muse 运行时中的真实运行界面。
 
-| 画布总览 | Agent 一句话成片 |
+| 画布总览：分镜节点连入成片节点 | 成片节点：7 个镜头汇总（约 30 秒） |
 | --- | --- |
-| ![画布总览](docs/screenshots/canvas-overview.png) | ![Agent 面板](docs/screenshots/agent-panel.png) |
+| ![画布总览](docs/screenshots/canvas-overview.jpg) | ![成片节点](docs/screenshots/film-node.jpg) |
 
-| 分镜工作流 | 成片与进度 |
-| --- | --- |
-| ![分镜工作流](docs/screenshots/storyboard-flow.png) | ![成片进度](docs/screenshots/film-progress.png) |
+分镜节点特写（画幅/时长/运镜、图生图变体、单图精修五件套、视频运动提示词与字幕）：
+
+![分镜节点与单图精修](docs/screenshots/shot-node.jpg)
 
 ## 实现框架
 
