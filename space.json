@@ -1,0 +1,8 @@
+{
+  "runtime": "typescript",
+  "platformVersion": 28,
+  "entry": "client/dist/index.html",
+  "name": "无限画布视频生成工具",
+  "slug": "wu-xian-hua-bu-shi-pin-sheng-cheng-gong-ju",
+  "managedCronJobs": []
+}

@@ -1,0 +1,121 @@
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&display=swap');
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+  --font-display: "Archivo", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #0c0d10;
+  --surface: #15171c;
+  --surface-2: #1c1f26;
+  --text: #eceef1;
+  --dim: #8b919c;
+  --border: #262a31;
+  --accent: #ff5a2a;
+  --accent-ink: #ffffff;
+  --cyan: #39d0d8;
+  --ok: #4ade80;
+  --radius: 10px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-2);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #e8e9ec;
+    --surface: #ffffff;
+    --surface-2: #f2f3f5;
+    --text: #17191d;
+    --dim: #5f6570;
+    --border: #d4d7dd;
+    --accent: #e8491d;
+    --cyan: #0e8f99;
+  }
+}
+
+html,
+body {
+  overscroll-behavior: none;
+}
+
+.canvas-dots {
+  background-image: radial-gradient(circle, color-mix(in srgb, var(--text) 13%, transparent) 1.1px, transparent 1.2px);
+  background-size: 26px 26px;
+}
+
+.canvas-lines {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--text) 8%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--text) 8%, transparent) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+.canvas-blank {
+  background-image: none;
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
+  70% { box-shadow: 0 0 0 9px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.generating-glow {
+  animation: pulse-ring 1.4s ease-out infinite;
+}
+
+@keyframes dash-move {
+  to { stroke-dashoffset: -18; }
+}
+.edge-flow {
+  stroke-dasharray: 6 5;
+  animation: dash-move 0.9s linear infinite;
+}
+
+/* Indeterminate film-progress bar: slides across the track until the
+   background task reports its first finished shot clip, when the UI
+   swaps in the determinate bar driven by real done/total counts. */
+@keyframes film-progress-slide {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+.film-progress-indeterminate {
+  animation: film-progress-slide 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .generating-glow,
+  .edge-flow,
+  .film-progress-indeterminate {
+    animation: none;
+  }
+  .film-progress-indeterminate {
+    left: 0;
+    width: 100%;
+    opacity: 0.45;
+  }
+}

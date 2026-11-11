@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+.bun-cache/
+client/dist/
+client/dist-cvm/
+server/dist/
+.space-build/
+.space-build-cvm/
+*.tsbuildinfo
+
+# 运行时数据（绝不入库：用户项目、媒体与成片都在这里）
+app.db
+app.db-shm
+app.db-wal
+blobs/
+.harness/
+audits/
+.xmds-icon
+icon.webp
