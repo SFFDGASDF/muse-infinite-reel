@@ -1,6 +1,6 @@
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { NODE_W, type Aspect, type CanvasNode, type Motion } from "./types";
-import { AssembledFilmPlayer, downloadAssembledFilm } from "./filmAssembly";
+import { DirectFilmDownload, DirectFilmPlayer } from "./filmAssembly";
 
 export type TextMode = "expand" | "script" | "storyboard" | "captions";
 
@@ -119,11 +119,18 @@ export function NodeCard(props: NodeCardProps) {
   const [brokenVideoUrl, setBrokenVideoUrl] = useState("");
   const videoBroken = node.type === "video" && node.url !== "" && brokenVideoUrl === node.url;
   // Chunked films: the node carries an assembly manifest instead of a
-  // URL. The player reassembles + verifies the chunks in the browser;
-  // if verification fails the film is reported broken (no download).
-  const hasAssembly = node.type === "video" && node.filmAssembly != null;
+  // URL. Playback/download go through the server's whole-file copy
+  // (DirectFilmPlayer/DirectFilmDownload — one request, no browser
+  // reassembly); the verified chunk-reassembly path remains only as
+  // the fallback when no whole-file copy exists, and if that fails
+  // the film is reported broken (no download).
+  // If the server turns out to have NO assembly record for the request
+  // (a stale manifest on an old-format save) and the node still holds a
+  // plain video URL, assemblyGone drops the node back to the ordinary
+  // blob player/download path instead of an error state.
+  const [assemblyGone, setAssemblyGone] = useState(false);
+  const hasAssembly = node.type === "video" && node.filmAssembly != null && !assemblyGone;
   const [assemblyBroken, setAssemblyBroken] = useState(false);
-  const [assemblyDownloading, setAssemblyDownloading] = useState(false);
   const [assemblyDlError, setAssemblyDlError] = useState("");
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(node.title);
@@ -769,10 +776,13 @@ export function NodeCard(props: NodeCardProps) {
         {node.type === "video" && (
           <>
             {hasAssembly && node.filmAssembly ? (
-              <AssembledFilmPlayer
+              <DirectFilmPlayer
                 assembly={node.filmAssembly}
                 title={node.title}
                 autoLoad
+                onUnavailable={
+                  node.url ? () => setAssemblyGone(true) : undefined
+                }
                 onBroken={() => {
                   setAssemblyBroken(true);
                   if (node.filmAssembly) {
@@ -797,6 +807,7 @@ export function NodeCard(props: NodeCardProps) {
                     src={node.url}
                     controls
                     playsInline
+                    draggable={false}
                     className="h-full w-full object-contain"
                     onError={() => {
                       setBrokenVideoUrl(node.url);
@@ -1007,6 +1018,7 @@ export function NodeCard(props: NodeCardProps) {
                 <a
                   href={node.url}
                   download={`${node.title}.mp4`}
+                  draggable={false}
                   className="rounded-md border border-[var(--border)] px-2 py-1.5 text-xs text-[var(--text)]"
                   aria-label={`下载视频 ${node.title}`}
                 >
@@ -1014,29 +1026,23 @@ export function NodeCard(props: NodeCardProps) {
                 </a>
               )}
               {hasAssembly && node.filmAssembly && !assemblyBroken && (
-                <button
-                  type="button"
-                  className="rounded-md border border-[var(--border)] px-2 py-1.5 text-xs text-[var(--text)] disabled:opacity-50"
-                  aria-label={`下载视频 ${node.title}`}
-                  disabled={assemblyDownloading}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    const assembly = node.filmAssembly;
-                    if (!assembly) return;
-                    setAssemblyDownloading(true);
-                    setAssemblyDlError("");
-                    downloadAssembledFilm(assembly.requestId, `${node.title}.mp4`)
-                      .catch((err: unknown) => {
-                        setAssemblyBroken(true);
-                        setAssemblyDlError(
-                          err instanceof Error ? err.message : "成片拼装失败",
-                        );
-                      })
-                      .finally(() => setAssemblyDownloading(false));
+                <DirectFilmDownload
+                  requestId={node.filmAssembly.requestId}
+                  filename={`${node.title}.mp4`}
+                  className="rounded-md border border-[var(--border)] px-2 py-1.5 text-xs text-[var(--text)]"
+                  ariaLabel={`下载视频 ${node.title}`}
+                  onUnavailable={
+                    // No server-side assembly record, but a plain
+                    // video URL exists: fall back to it silently.
+                    node.url ? () => setAssemblyGone(true) : undefined
+                  }
+                  onError={(message) => {
+                    setAssemblyBroken(true);
+                    setAssemblyDlError(message);
                   }}
                 >
-                  {assemblyDownloading ? "拼装中…" : "下载"}
-                </button>
+                  下载
+                </DirectFilmDownload>
               )}
             </div>
             {assemblyDlError && (

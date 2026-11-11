@@ -120,6 +120,15 @@ export const filmAssemblies = sqliteTable("film_assemblies", {
   totalBytes: integer("total_bytes").notNull().default(0),
   sha256: text("sha256").notNull().default(""),
   mime: text("mime").notNull().default("video/mp4"),
+  // Blob key of the OPTIONAL whole-file copy of the sealed film. The
+  // chunked store above remains the integrity record of truth; this
+  // single blob exists purely so playback/download can fetch the
+  // complete MP4 in ONE request instead of reassembling chunks in the
+  // browser on every click. Written at import/replace time (the server
+  // holds the whole file then) or materialized later by getFilmFile;
+  // empty when no whole-file copy exists yet — readers then fall back
+  // to the chunked assembly path.
+  fullBlobKey: text("full_blob_key").notNull().default(""),
   status: text("status", { enum: ["open", "sealed"] }).notNull().default("open"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()

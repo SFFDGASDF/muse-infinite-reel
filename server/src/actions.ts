@@ -6,6 +6,7 @@
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { desc, eq } from "drizzle-orm";
+import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
 import { contracts } from "@space/privileged";
 
@@ -23,8 +24,10 @@ const generationRow = z.object({
   node_id: z.string(),
   url: z.string(),
   created_at: z.string(),
-  /** True when this video is a chunked film assembly: `url` is empty
-   *  and the bytes are reassembled client-side from `film_request_id`. */
+  /** True when this video is a chunked film assembly. `url` carries
+   *  the whole-file copy's URL when one exists; otherwise it is empty
+   *  and the client resolves the film via `film_request_id`
+   *  (getFilmFile first, chunked assembly as fallback). */
   chunked: z.boolean(),
   film_request_id: z.number().nullable(),
 });
@@ -302,6 +305,23 @@ const filmAssemblyResponse = z.object({
   chunk_urls: z.array(z.string()),
 });
 
+/** Direct whole-file access for a sealed chunked film: `url` points at
+ *  ONE blob holding the complete MP4, so the browser downloads/plays
+ *  it in a single request — no per-chunk fetches, no client-side
+ *  reassembly, no repeat verification (the seal already verified every
+ *  chunk's hash and the whole-file total before marking the film
+ *  done). `url` is empty when no whole-file copy could be produced;
+ *  the client then falls back to the chunked assembly path. */
+const filmFileResponse = z.object({
+  found: z.boolean(),
+  sealed: z.boolean(),
+  url: z.string(),
+  total_bytes: z.number(),
+  sha256: z.string(),
+  mime: z.string(),
+  chunk_count: z.number(),
+});
+
 const filmProgressResponse = z.object({ ok: z.literal(true) });
 const cancelFilmResponse = z.object({
   ok: z.boolean(),
@@ -396,8 +416,10 @@ function isSavingStage(stage: string | null | undefined): boolean {
 // before storing, chunk-0 MP4 head gate, idempotent resume) and the
 // SAME seal (sealAssembly) as the manual chunk actions, which remain
 // available as the underlying mechanism. The agent emits exactly one
-// small call; a ≤1.5MB delivery encode is ~46 chunks, each stored
-// chunk a fresh progress heartbeat.
+// small call; the delivery encode is quality-first (native resolution,
+// CRF 18–20 — see the saving contract in the spawn briefs), typically
+// a few MB up to the 64MB mechanism cap below, and each stored chunk
+// is a fresh progress heartbeat.
 const FILM_CHUNK_BYTES = 32 * 1024;
 const FILM_CHUNK_BASE64_MAX = 60_000;
 const FILM_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
@@ -415,6 +437,25 @@ function isFilmAssemblyMarker(key: string): boolean {
 }
 function filmChunkBlobKey(projectId: number, requestId: number, index: number): string {
   return `p${projectId}/film-${requestId}/chunk-${String(index).padStart(4, "0")}`;
+}
+
+/** Blob key of the whole-file copy of a sealed film (see
+ *  filmAssemblies.fullBlobKey). `versionTag` distinguishes a staged
+ *  replacement's copy from the currently-live one so a replace can
+ *  write the new file before the atomic swap. */
+function filmFullBlobKey(projectId: number, requestId: number, versionTag?: string): string {
+  return `p${projectId}/film-${requestId}/full${versionTag ? `-v${versionTag}` : ""}.mp4`;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -599,6 +640,33 @@ async function reportChunkProgress(
   }
 }
 
+/** Structural head gate for chunk 0 of an MP4 film: the file must
+ *  OPEN as an MP4 — a valid ftyp box with a sane size and a printable
+ *  major brand. Hashes alone cannot provide this check (a non-MP4
+ *  file hashes perfectly self-consistently). Shared by storeFilmChunk
+ *  and the staged ingest of replaceFilmFromWorkspace. */
+function assertMp4ChunkHead(bytes: Uint8Array, mimeRaw: string): void {
+  const mime = (mimeRaw || "video/mp4").toLowerCase();
+  if (!(mime.includes("mp4") || mime.includes("quicktime"))) return;
+  const headView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const boxType =
+    bytes.length >= 8
+      ? String.fromCharCode(bytes[4] ?? 0, bytes[5] ?? 0, bytes[6] ?? 0, bytes[7] ?? 0)
+      : "";
+  const boxSize = bytes.length >= 4 ? headView.getUint32(0) : 0;
+  const brandOk =
+    bytes.length >= 12 &&
+    [8, 9, 10, 11].every((i) => {
+      const c = bytes[i] ?? 0;
+      return c >= 0x20 && c <= 0x7e;
+    });
+  if (boxType !== "ftyp" || !(boxSize >= 8 || boxSize === 1) || !brandOk) {
+    throw new Error(
+      "第 1 片的开头不是有效的 MP4 文件头（第一个 box 应为 ftyp）——这不是一个完整的 MP4 文件，没有保存。请先在本地用 ffprobe 确认交付版能完整解码，再从第 1 片开始重新传",
+    );
+  }
+}
+
 /** Store ONE chunk of a film assembly — the single verified ingest
  *  path shared by saveFilmChunk (base64 emitted by the background
  *  task) and importFilmFromWorkspace (slices read host-side from the
@@ -646,26 +714,7 @@ async function storeFilmChunk(
   // client-side after reassembly (the server cannot read chunks
   // back to walk them — BlobClient has no read API).
   if (index === 0) {
-    const mime = (assembly.mime || "video/mp4").toLowerCase();
-    if (mime.includes("mp4") || mime.includes("quicktime")) {
-      const headView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const boxType =
-        bytes.length >= 8
-          ? String.fromCharCode(bytes[4] ?? 0, bytes[5] ?? 0, bytes[6] ?? 0, bytes[7] ?? 0)
-          : "";
-      const boxSize = bytes.length >= 4 ? headView.getUint32(0) : 0;
-      const brandOk =
-        bytes.length >= 12 &&
-        [8, 9, 10, 11].every((i) => {
-          const c = bytes[i] ?? 0;
-          return c >= 0x20 && c <= 0x7e;
-        });
-      if (boxType !== "ftyp" || !(boxSize >= 8 || boxSize === 1) || !brandOk) {
-        throw new Error(
-          "第 1 片的开头不是有效的 MP4 文件头（第一个 box 应为 ftyp）——这不是一个完整的 MP4 文件，没有保存。请先在本地用 ffprobe 确认交付版能完整解码，再从第 1 片开始重新传",
-        );
-      }
-    }
+    assertMp4ChunkHead(bytes, assembly.mime || "video/mp4");
   }
   const existingRows = await db
     .select()
@@ -806,6 +855,95 @@ async function sealAssembly(
   return { chunk_count: assembly.chunkCount, total_bytes: assembly.totalBytes };
 }
 
+/** Materialize the whole-file copy of a SEALED assembly that does not
+ *  have one yet (films sealed before the direct-file path existed).
+ *  Two sources, tried in order, both fully verified against the
+ *  sealed manifest before anything is stored:
+ *  1. the delivery file the background task left on this host
+ *     (~/workspace/film-delivery/<requestId>/delivery.mp4) — only when
+ *     its size AND whole-file SHA-256 match the sealed manifest
+ *     exactly, read back through the same privileged contracts the
+ *     import used;
+ *  2. the stored chunk blobs themselves, fetched back over their blob
+ *     URLs and concatenated in order.
+ *  On success the assembly's fullBlobKey is recorded and the blob key
+ *  returned; on any failure returns "" and the caller falls back to
+ *  the chunked assembly path — a failed materialization never touches
+ *  the sealed chunks. */
+async function materializeFullFilmBlob(
+  ctx: Ctx,
+  db: AgentDb,
+  assembly: NonNullable<Awaited<ReturnType<typeof loadAssembly>>>,
+): Promise<string> {
+  if (assembly.status !== "sealed") return "";
+  const mime = assembly.mime || "video/mp4";
+  const key = filmFullBlobKey(assembly.projectId, assembly.requestId);
+  const record = async (bytes: Uint8Array): Promise<string> => {
+    if (bytes.length !== assembly.totalBytes) return "";
+    if ((await sha256Hex(bytes)) !== assembly.sha256.toLowerCase()) return "";
+    await ctx.blobs.put(key, bytes, { contentType: mime });
+    const head = await ctx.blobs.head(key);
+    if (!head || head.sizeBytes !== assembly.totalBytes) return "";
+    await db
+      .update(schema.filmAssemblies)
+      .set({ fullBlobKey: key, updatedAt: new Date() })
+      .where(eq(schema.filmAssemblies.id, assembly.id));
+    return key;
+  };
+  // Source 1: the host-side delivery file, if it is still there and
+  // is byte-identical to the sealed film.
+  try {
+    const info = await ctx.executePrivileged(contracts.filmFileInfo, {
+      requestId: assembly.requestId,
+    });
+    if (
+      info.found &&
+      info.totalBytes === assembly.totalBytes &&
+      info.sha256.toLowerCase() === assembly.sha256.toLowerCase()
+    ) {
+      const parts: Uint8Array[] = [];
+      for (let i = 0; i < assembly.chunkCount; i++) {
+        const part = await ctx.executePrivileged(contracts.readFilmChunk, {
+          requestId: assembly.requestId,
+          index: i,
+          chunkBytes: FILM_CHUNK_BYTES,
+        });
+        const bytes = decodeBase64(part.dataBase64);
+        if (bytes.length !== part.byteLength) throw new Error("chunk read length mismatch");
+        parts.push(bytes);
+      }
+      const done = await record(concatBytes(parts));
+      if (done) return done;
+    }
+  } catch {
+    // Delivery file gone or unreadable — try the chunk blobs.
+  }
+  // Source 2: fetch the stored chunk blobs back and concatenate.
+  try {
+    const chunkRows = await db
+      .select()
+      .from(schema.filmChunks)
+      .where(eq(schema.filmChunks.assemblyId, assembly.id))
+      .orderBy(schema.filmChunks.idx);
+    if (chunkRows.length === assembly.chunkCount) {
+      const parts: Uint8Array[] = [];
+      for (const row of chunkRows) {
+        const url = await ctx.blobs.getUrl(row.blobKey);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`chunk fetch ${res.status}`);
+        const buf = new Uint8Array(await res.arrayBuffer());
+        if (buf.length !== row.byteLength) throw new Error("chunk length mismatch");
+        parts.push(buf);
+      }
+      const done = await record(concatBytes(parts));
+      if (done) return done;
+    }
+  } catch {
+    // No readable source — the chunked path remains the fallback.
+  }
+  return "";
+}
+
 function filmStallState(row: {
   status: string;
   createdAt: Date;
@@ -927,8 +1065,9 @@ function agentNode(partial: Partial<GraphNodeLike> & { id: string; type: string 
   };
 }
 
-/** Build the zoned canvas for an agent run: input / script / asset /
- *  storyboard / production columns, left to right. */
+/** Build the zoned canvas for an agent run: input / script / asset
+ *  zones on the left, the storyboard shots as a wrapped grid, and the
+ *  成片 node to the right of the grid, vertically centered on it. */
 function agentGraphSkeleton(args: {
   instruction: string;
   aspect: string;
@@ -984,13 +1123,23 @@ function agentGraphSkeleton(args: {
       aspect: args.aspect,
     }),
   ];
+  // Storyboard shots are laid out as a WRAPPED GRID (row-major, story
+  // order) — never one long vertical strip. The column count mirrors
+  // the client's gridColumnCount (client/src/types.ts): roughly √N
+  // biased wider, capped at 6 across.
+  const shotCount = args.plan.shots.length;
+  const shotCols =
+    shotCount <= 1
+      ? 1
+      : Math.min(6, Math.max(2, Math.round(Math.sqrt(shotCount * 1.9))));
+  const shotRows = Math.max(1, Math.ceil(shotCount / shotCols));
   args.plan.shots.forEach((shot, i) => {
     nodes.push(
       agentNode({
         id: args.shotNodeIds[i] ?? `n-agent-shot-${i + 1}`,
         type: "image",
-        x: shotX,
-        y: 60 + i * 372,
+        x: shotX + (i % shotCols) * 380,
+        y: 60 + Math.floor(i / shotCols) * 372,
         title: `镜头 ${i + 1}`,
         // The unified anchor text is baked into every shot's prompt —
         // this text anchoring is what keeps character/style consistent.
@@ -1003,12 +1152,12 @@ function agentGraphSkeleton(args: {
       }),
     );
   });
-  const filmY = args.plan.shots.length > 1 ? 60 + ((args.plan.shots.length - 1) * 372) / 2 : 140;
+  const filmY = shotRows > 1 ? 60 + ((shotRows - 1) * 372) / 2 : 140;
   nodes.push(
     agentNode({
       id: args.filmNodeId,
       type: "video",
-      x: 1620,
+      x: shotX + shotCols * 380,
       y: filmY,
       title: "成片",
       aspect: args.aspect,
@@ -1086,7 +1235,7 @@ async function spawnAgentFilm(
     `2. For each shot, generate ONE true-motion video clip from that keyframe, driven by the shot's motion_prompt and camera_motion, about duration_seconds long. The subject itself must really move (image-to-video) — never a slideshow of stills, never pan/zoom over a static image, never frame interpolation presented as motion. Generate at most 6 clips per round; if there are more than 6 shots, continue in consecutive rounds until every shot has a clip. After EACH finished clip, report both channels with doneShots = clips finished so far and stage "正在生成镜头视频".`,
     `3. Music: report both channels with stage "正在配乐" (agent status "scoring"). Create or select ONE original background-music track whose mood matches: ${args.musicMood || "the story's emotional tone"}. It must fit the film's total length (loop/trim as needed) and sit under the picture at a modest level. There is no dialogue in this production, so add NO narration/voiceover. If you genuinely cannot produce any music track after a real attempt, say so plainly in your final chat report — but still finish and save the film; never fake a music credit.`,
     `4. Editing: report both channels with stage "正在按剧情剪辑合成" (agent status "editing"). Edit the clips into ONE coherent film in index order with ffmpeg: conform each clip to its duration_seconds, unify resolution and frame rate according to the shots' aspect, burn each shot's caption as a bottom subtitle shown during that shot (skip empty captions), mix the background music across the whole film (fade out at the end), and cut like a director following the story — straight cuts, at most a very short dissolve where it genuinely helps continuity. The result is a single MP4 (H.264, yuv420p, faststart) WITH the music track muxed in.`,
-    `5. Saving — HOST-SIDE IMPORT, follow this contract exactly; it exists because saving is where every past production died. NEVER send the whole film as one action argument: the old whole-file save no longer exists — five real productions were lost to that single all-or-nothing call (bytes mangled in transit and stored unchecked, tasks vanishing mid-call with the request hanging for hours). (a) FIRST produce a "delivery encode" of the finished film BEFORE any save call: 720p (1280x720 for 16:9, 720x1280 for 9:16, 720x720 for 1:1), H.264, with the bitrate chosen so the file lands at or below about 1.5MB (for a ~30s film that is roughly 350-400 kbps total; scale the bitrate by the film's actual duration). Keep the full-resolution master as a separate local file — NEVER send the master to the tool. (b) FILE DISCIPLINE + INTEGRITY, before any upload: do ALL of this save's file work in a directory named after this request — ~/workspace/film-delivery/${requestId}/ — and never use a shared temp filename: other productions may be running concurrently and a shared path gets overwritten (this exact accident already killed one save: the registered file was replaced before upload and no longer matched its hash). Verify the delivery file on your side (ffprobe must open it and report its full expected duration, and a full decode pass must not error), then compute its total byte size and its whole-file SHA-256 (e.g. sha256sum). The delivery encode MUST end up at the exact path ~/workspace/film-delivery/${requestId}/delivery.mp4 (folder named by the request id, file named exactly delivery.mp4) — that fixed location is how the tool finds it. Once you call importFilmFromWorkspace, the delivery file is FROZEN: never re-encode, move, or overwrite it until that call returns; keep any re-encode as a NEW file under a new name and, if its size/hash differ, that is a different film — do not mix the two. (c) Report reportAgentProgress { "runId": ${args.runId}, "status": "saving", "doneShots": ${args.shots.length}, "stage": "正在保存成片" } once. (d) Save with ONE call: importFilmFromWorkspace { "requestId": ${requestId} }. The tool reads ~/workspace/film-delivery/${requestId}/delivery.mp4 itself on the server host, slices it into ≤32KB chunks, verifies every chunk's SHA-256 before storing it, then seals the save — film attached to the 成片 node, history recorded, everything marked done. NEVER emit film bytes (base64 or otherwise) in an action call yourself: that channel is what killed every earlier save, at every size tried. Progress (正在保存成片 · 已传 X/N 片) is reported automatically per stored chunk and resets the no-progress clock on both channels. A save only counts when importFilmFromWorkspace returns ok. (e) If importFilmFromWorkspace returns an error, read it and fix exactly what it names — file missing or at the wrong path: put the delivery encode at the exact path above; file not a valid MP4: re-encode the delivery encode and replace delivery.mp4 — then call importFilmFromWorkspace again, at most 3 tries total; chunks already stored are skipped, so a retry resumes instead of starting over. (f) If it still fails after 3 tries, IMMEDIATELY call failFilmSave with { "requestId": ${requestId}, "reason": "<the actual error, in one short plain sentence>" } so the tool marks this production failed right away (it also records that the finished film exists on your side) — never leave the request hanging in "saving" — and then deliver the finished film file to the user directly in chat yourself. Do not invent a video or save anything else under the film's name.`,
+    `5. Saving — HOST-SIDE IMPORT, follow this contract exactly; it exists because saving is where every past production died. NEVER send the whole film as one action argument: the old whole-file save no longer exists — five real productions were lost to that single all-or-nothing call (bytes mangled in transit and stored unchecked, tasks vanishing mid-call with the request hanging for hours). (a) FIRST produce a "delivery encode" of the finished film BEFORE any save call — QUALITY FIRST, because this encode is exactly what the tool stores, plays, and offers for download. Keep the finished film's NATIVE resolution (whatever the edited master is — 1280x720, 720x1280, 1080p, …): NEVER downscale it, and never target a fixed file size. Encode H.264 at constant quality, CRF 18–20 (for 720p material that lands around 6 Mbps or higher; use -preset slow if time permits). An old rule capped this encode at ~1.5MB / a few hundred kbps — it was a workaround for a dead save channel, it made longer films unwatchably blurry, and it is ABOLISHED: do not resurrect it. The ONLY size limit is the tool's import cap of 64MB (67,108,864 bytes); if a CRF 18–20 encode would exceed 64MB, raise the CRF only as far as needed to fit under the cap and keep the native resolution. Keep the full-resolution master as a separate local file as well. (b) FILE DISCIPLINE + INTEGRITY, before any upload: do ALL of this save's file work in a directory named after this request — ~/workspace/film-delivery/${requestId}/ — and never use a shared temp filename: other productions may be running concurrently and a shared path gets overwritten (this exact accident already killed one save: the registered file was replaced before upload and no longer matched its hash). Verify the delivery file on your side (ffprobe must open it and report its full expected duration, and a full decode pass must not error), then compute its total byte size and its whole-file SHA-256 (e.g. sha256sum). The delivery encode MUST end up at the exact path ~/workspace/film-delivery/${requestId}/delivery.mp4 (folder named by the request id, file named exactly delivery.mp4) — that fixed location is how the tool finds it. Once you call importFilmFromWorkspace, the delivery file is FROZEN: never re-encode, move, or overwrite it until that call returns; keep any re-encode as a NEW file under a new name and, if its size/hash differ, that is a different film — do not mix the two. (c) Report reportAgentProgress { "runId": ${args.runId}, "status": "saving", "doneShots": ${args.shots.length}, "stage": "正在保存成片" } once. (d) Save with ONE call: importFilmFromWorkspace { "requestId": ${requestId} }. The tool reads ~/workspace/film-delivery/${requestId}/delivery.mp4 itself on the server host, slices it into ≤32KB chunks, verifies every chunk's SHA-256 before storing it, then seals the save — film attached to the 成片 node, history recorded, everything marked done. NEVER emit film bytes (base64 or otherwise) in an action call yourself: that channel is what killed every earlier save, at every size tried. Progress (正在保存成片 · 已传 X/N 片) is reported automatically per stored chunk and resets the no-progress clock on both channels. A save only counts when importFilmFromWorkspace returns ok. If it returns ok with "imported_chunks": 0, this request already has a sealed film and NOTHING was overwritten; only when you are deliberately re-delivering a corrected or higher-quality encode of the SAME film for this SAME request, call replaceFilmFromWorkspace { "requestId": ${requestId} } instead — it stages and fully verifies the new file first, then swaps atomically, and a failed replace leaves the sealed film untouched. Never use it for a different film. (e) If importFilmFromWorkspace returns an error, read it and fix exactly what it names — file missing or at the wrong path: put the delivery encode at the exact path above; file not a valid MP4: re-encode the delivery encode and replace delivery.mp4 — then call importFilmFromWorkspace again, at most 3 tries total; chunks already stored are skipped, so a retry resumes instead of starting over. (f) If it still fails after 3 tries, IMMEDIATELY call failFilmSave with { "requestId": ${requestId}, "reason": "<the actual error, in one short plain sentence>" } so the tool marks this production failed right away (it also records that the finished film exists on your side) — never leave the request hanging in "saving" — and then deliver the finished film file to the user directly in chat yourself. Do not invent a video or save anything else under the film's name.`,
     "6. Afterwards, tell the user briefly in chat that the film is done and saved into the tool (it shows on the 成片 node and in the 生成历史）, with the shot count, total duration, and whether the background music was included. If one shot's clip fails after a genuine retry, still finish the film with the remaining shots in order and say plainly which shot is missing. If you cannot produce any real clip at all, say so plainly in chat and do NOT save anything.",
   ].join("\n");
 
@@ -1560,14 +1709,25 @@ export const Actions = {
         rows.map(async (row) => {
           const chunked = isFilmAssemblyMarker(row.blobKey);
           const markerId = chunked ? Number(row.blobKey.slice("film-assembly:".length)) : NaN;
+          let url = "";
+          if (!chunked) {
+            url = await ctx.blobs.getUrl(row.blobKey);
+          } else if (Number.isFinite(markerId)) {
+            // A chunked film WITH a whole-file copy plays/downloads
+            // straight from that one blob; without one the URL stays
+            // empty and the client uses the direct-file action (which
+            // materializes the copy) or the chunked assembly fallback.
+            const assembly = await loadAssembly(db, markerId);
+            if (assembly?.fullBlobKey) {
+              url = await ctx.blobs.getUrl(assembly.fullBlobKey);
+            }
+          }
           return {
             id: row.id,
             kind: row.kind,
             prompt: row.prompt,
             node_id: row.nodeId,
-            // A chunked film has no single playable blob URL — the
-            // client reassembles it from its chunks instead.
-            url: chunked ? "" : await ctx.blobs.getUrl(row.blobKey),
+            url,
             created_at: row.createdAt.toISOString(),
             chunked,
             film_request_id: Number.isFinite(markerId) ? markerId : null,
@@ -1786,7 +1946,7 @@ export const Actions = {
         `1. Call the artifact action getFilmRequest with { "requestId": ${requestId} } to get the ordered shot list. Per shot you get: index, title, blob_key (the storyboard image's blob key in the artifact's storage), image_prompt, motion_prompt (what moves in the shot and how — may be empty), caption (subtitle line, may be empty), duration_seconds, camera_motion, aspect. Note: the storyboard image bytes themselves are not readable from chat (the artifact's blob storage exposes no read path to you), so for each shot first regenerate its keyframe image from image_prompt with your own image generation, matching the prompt's subject, composition, colors and the shot's aspect.`,
         `2. For each shot, generate ONE true-motion video clip from that keyframe, driven by the shot's motion_prompt and camera_motion, about duration_seconds long. The subject itself must really move (image-to-video) — never a slideshow of stills, never pan/zoom over a static image, never frame interpolation presented as motion. Generate at most 6 clips per round; if there are more than 6 shots, continue in consecutive rounds until every shot has a clip. IMPORTANT — report progress so the tool's progress bar moves for real AND the request is not mistaken for stalled: (a) immediately when you start, call reportFilmProgress with { "requestId": ${requestId}, "doneShots": 0, "stage": "正在生成镜头片段" }; (b) after EACH shot's clip is finished, call reportFilmProgress with { "requestId": ${requestId}, "doneShots": <number of clips finished so far>, "stage": "正在生成镜头片段" }; (c) if any single clip takes more than about 3 minutes, call reportFilmProgress again with the same doneShots and a stage like "正在生成镜头片段（第 N 镜生成中）" as a heartbeat. If you go 15 minutes without any reportFilmProgress call the tool will auto-fail the request as stalled.`,
         `3. Before editing, call reportFilmProgress with { "requestId": ${requestId}, "doneShots": ${shots.length}, "stage": "正在按剧情剪辑合成" }. Then edit the clips into ONE coherent film in index order with ffmpeg: conform each clip to its duration_seconds, unify resolution and frame rate according to the shots' aspect (they share one aspect in practice), burn each shot's caption as a bottom subtitle shown during that shot (skip empty captions), and cut like a director following the story — straight cuts, at most a very short dissolve where it genuinely helps continuity. The result is a single MP4 (H.264, yuv420p, faststart).`,
-        `4. Saving — HOST-SIDE IMPORT, follow this contract exactly; it exists because saving is where every past film request died. NEVER send the whole film as one action argument: the old whole-file save no longer exists — five real productions were lost to that single all-or-nothing call (bytes mangled in transit and stored unchecked, tasks vanishing mid-call with the request hanging for hours). (a) FIRST produce a "delivery encode" of the finished film BEFORE any save call: 720p at the film's aspect (1280x720 for 16:9, 720x1280 for 9:16, 720x720 for 1:1), H.264, with the bitrate chosen so the file lands at or below about 1.5MB (for a ~45s film that is roughly 250-300 kbps total; scale the bitrate by the film's actual duration). Keep the full-resolution master as a separate local file — NEVER send the master to the tool. (b) FILE DISCIPLINE + INTEGRITY, before any upload: do ALL of this save's file work in a directory named after this request — ~/workspace/film-delivery/${requestId}/ — and never use a shared temp filename: other productions may be running concurrently and a shared path gets overwritten (this exact accident already killed one save: the registered file was replaced before upload and no longer matched its hash). Verify the delivery file on your side (ffprobe must open it and report its full expected duration, and a full decode pass must not error), then compute its total byte size and its whole-file SHA-256 (e.g. sha256sum). The delivery encode MUST end up at the exact path ~/workspace/film-delivery/${requestId}/delivery.mp4 (folder named by the request id, file named exactly delivery.mp4) — that fixed location is how the tool finds it. Once you call importFilmFromWorkspace, the delivery file is FROZEN: never re-encode, move, or overwrite it until that call returns; keep any re-encode as a NEW file under a new name and, if its size/hash differ, that is a different film — do not mix the two. (c) Save with ONE call: importFilmFromWorkspace { "requestId": ${requestId} }. The tool reads ~/workspace/film-delivery/${requestId}/delivery.mp4 itself on the server host, slices it into ≤32KB chunks, verifies every chunk's SHA-256 before storing it, then seals the save — film attached to the 成片 node, history recorded, the request marked done. NEVER emit film bytes (base64 or otherwise) in an action call yourself: that channel is what killed every earlier save, at every size tried. Progress (正在保存成片 · 已传 X/N 片) is reported automatically per stored chunk and resets the tool's no-progress clock. A save only counts when importFilmFromWorkspace returns ok. (d) If importFilmFromWorkspace returns an error, read it and fix exactly what it names — file missing or at the wrong path: put the delivery encode at the exact path above; file not a valid MP4: re-encode the delivery encode and replace delivery.mp4 — then call importFilmFromWorkspace again, at most 3 tries total; chunks already stored are skipped, so a retry resumes instead of starting over. (e) If it still fails after 3 tries, IMMEDIATELY call the artifact action failFilmSave with { "requestId": ${requestId}, "reason": "<the actual error, in one short plain sentence>" } so the tool marks this request failed right away (it also records that the finished film exists on your side) — never leave the request hanging in "saving" until a timeout kills it — and then deliver the finished film file to the user directly in chat yourself. Do not invent a video or save anything else under the film's name.`,
+        `4. Saving — HOST-SIDE IMPORT, follow this contract exactly; it exists because saving is where every past film request died. NEVER send the whole film as one action argument: the old whole-file save no longer exists — five real productions were lost to that single all-or-nothing call (bytes mangled in transit and stored unchecked, tasks vanishing mid-call with the request hanging for hours). (a) FIRST produce a "delivery encode" of the finished film BEFORE any save call — QUALITY FIRST, because this encode is exactly what the tool stores, plays, and offers for download. Keep the finished film's NATIVE resolution (whatever the edited master is — 1280x720, 720x1280, 1080p, …): NEVER downscale it, and never target a fixed file size. Encode H.264 at constant quality, CRF 18–20 (for 720p material that lands around 6 Mbps or higher; use -preset slow if time permits). An old rule capped this encode at ~1.5MB / a few hundred kbps — it was a workaround for a dead save channel, it made longer films unwatchably blurry, and it is ABOLISHED: do not resurrect it. The ONLY size limit is the tool's import cap of 64MB (67,108,864 bytes); if a CRF 18–20 encode would exceed 64MB, raise the CRF only as far as needed to fit under the cap and keep the native resolution. Keep the full-resolution master as a separate local file as well. (b) FILE DISCIPLINE + INTEGRITY, before any upload: do ALL of this save's file work in a directory named after this request — ~/workspace/film-delivery/${requestId}/ — and never use a shared temp filename: other productions may be running concurrently and a shared path gets overwritten (this exact accident already killed one save: the registered file was replaced before upload and no longer matched its hash). Verify the delivery file on your side (ffprobe must open it and report its full expected duration, and a full decode pass must not error), then compute its total byte size and its whole-file SHA-256 (e.g. sha256sum). The delivery encode MUST end up at the exact path ~/workspace/film-delivery/${requestId}/delivery.mp4 (folder named by the request id, file named exactly delivery.mp4) — that fixed location is how the tool finds it. Once you call importFilmFromWorkspace, the delivery file is FROZEN: never re-encode, move, or overwrite it until that call returns; keep any re-encode as a NEW file under a new name and, if its size/hash differ, that is a different film — do not mix the two. (c) Save with ONE call: importFilmFromWorkspace { "requestId": ${requestId} }. The tool reads ~/workspace/film-delivery/${requestId}/delivery.mp4 itself on the server host, slices it into ≤32KB chunks, verifies every chunk's SHA-256 before storing it, then seals the save — film attached to the 成片 node, history recorded, the request marked done. NEVER emit film bytes (base64 or otherwise) in an action call yourself: that channel is what killed every earlier save, at every size tried. Progress (正在保存成片 · 已传 X/N 片) is reported automatically per stored chunk and resets the tool's no-progress clock. A save only counts when importFilmFromWorkspace returns ok. If it returns ok with "imported_chunks": 0, this request already has a sealed film and NOTHING was overwritten; only when you are deliberately re-delivering a corrected or higher-quality encode of the SAME film for this SAME request, call replaceFilmFromWorkspace { "requestId": ${requestId} } instead — it stages and fully verifies the new file first, then swaps atomically, and a failed replace leaves the sealed film untouched. Never use it for a different film. (d) If importFilmFromWorkspace returns an error, read it and fix exactly what it names — file missing or at the wrong path: put the delivery encode at the exact path above; file not a valid MP4: re-encode the delivery encode and replace delivery.mp4 — then call importFilmFromWorkspace again, at most 3 tries total; chunks already stored are skipped, so a retry resumes instead of starting over. (e) If it still fails after 3 tries, IMMEDIATELY call the artifact action failFilmSave with { "requestId": ${requestId}, "reason": "<the actual error, in one short plain sentence>" } so the tool marks this request failed right away (it also records that the finished film exists on your side) — never leave the request hanging in "saving" until a timeout kills it — and then deliver the finished film file to the user directly in chat yourself. Do not invent a video or save anything else under the film's name.`,
         "5. Afterwards, tell the user briefly in chat that the film is done and saved into the tool (it shows on the 成片 node and in the 生成历史）, with the shot count and total duration. If one shot's clip fails after a genuine retry, still finish the film with the remaining shots in order and say plainly which shot is missing. If you cannot produce any real clip at all, say so plainly in chat and do NOT save anything.",
       ].join("\n");
 
@@ -2231,12 +2391,12 @@ export const Actions = {
       }
       if (info.totalBytes > FILM_MAX_TOTAL_BYTES) {
         throw new Error(
-          `交付版文件有 ${info.totalBytes} 字节，超过工具能保存的上限。请先压出 720p、约 1.5MB 以内的交付版，覆盖 delivery.mp4 后再调用 importFilmFromWorkspace`,
+          `高清交付版文件有 ${info.totalBytes} 字节，超过工具能保存的上限（64MB）。请保持原分辨率不变、适当调高 CRF 把文件压到 64MB 以内（不要降分辨率、不要按固定小体积目标压），覆盖 delivery.mp4 后再调用 importFilmFromWorkspace`,
         );
       }
       const chunkCount = Math.ceil(info.totalBytes / FILM_CHUNK_BYTES);
       if (chunkCount > FILM_MAX_CHUNKS) {
-        throw new Error("交付版文件的分片数超过上限。请压出更小的交付版后再导入");
+        throw new Error("高清交付版文件的分片数超过上限（等同超过 64MB）。请保持原分辨率不变、适当调高 CRF 把文件压到 64MB 以内后再导入");
       }
       if (!assembly) {
         const insertedRows = await db
@@ -2292,8 +2452,12 @@ export const Actions = {
       }
       const received = new Set(await receivedChunkIndices(db, assembly.id));
       let imported = 0;
+      // Every slice is read from the delivery file even when its chunk
+      // is already stored: the slices are also concatenated into the
+      // whole-file copy below, so playback/download never reassemble
+      // chunks in the browser.
+      const fullParts: Uint8Array[] = [];
       for (let i = 0; i < assembly.chunkCount; i++) {
-        if (received.has(i)) continue;
         const part = await ctx.executePrivileged(contracts.readFilmChunk, {
           requestId: args.requestId,
           index: i,
@@ -2305,16 +2469,297 @@ export const Actions = {
             `第 ${i + 1} 片读取长度异常。已存好的分片不会丢失，请直接重试 importFilmFromWorkspace 续传`,
           );
         }
+        fullParts.push(bytes);
+        if (received.has(i)) continue;
         await storeFilmChunk(ctx, db, assembly, i, bytes, part.sha256);
         imported++;
       }
       const sealed = await sealAssembly(ctx, db, assembly);
+      // Whole-file copy for direct playback/download. Best-effort: the
+      // sealed chunks are the record of truth, and getFilmFile can
+      // materialize this copy later if writing it here fails.
+      try {
+        const full = concatBytes(fullParts);
+        if (
+          full.length === info.totalBytes &&
+          (await sha256Hex(full)) === info.sha256.toLowerCase()
+        ) {
+          const fullKey = filmFullBlobKey(req.projectId, req.id);
+          await ctx.blobs.put(fullKey, full, { contentType: "video/mp4" });
+          const head = await ctx.blobs.head(fullKey);
+          if (head && head.sizeBytes === info.totalBytes) {
+            await db
+              .update(schema.filmAssemblies)
+              .set({ fullBlobKey: fullKey, updatedAt: new Date() })
+              .where(eq(schema.filmAssemblies.id, assembly.id));
+          }
+        }
+      } catch {
+        // Direct-file copy is an optimization; the sealed film stands.
+      }
       ctx.invalidateQueries();
       return {
         ok: true,
         chunk_count: sealed.chunk_count,
         total_bytes: sealed.total_bytes,
         imported_chunks: imported,
+      };
+    },
+  }),
+
+  replaceFilmFromWorkspace: defineAction({
+    description:
+      "Explicitly REPLACES the already-sealed film of a film request with the file now at ~/workspace/film-delivery/<requestId>/delivery.mp4 (e.g. a higher-quality re-encode of the same film). The new file is staged chunk by chunk under versioned blob keys with the same verification as a first save (per-chunk SHA-256 over the received bytes, MP4 ftyp head gate, per-blob size check); only when every chunk is staged and verified does ONE atomic batch swap the chunk rows, the assembly manifest, the 成片 node's manifest and the history entry to the new version, after which the old chunks are deleted. Any failure before the swap leaves the sealed film completely untouched. If the delivery file is byte-identical to the sealed film, this is a no-op. For a first save (nothing sealed yet) use importFilmFromWorkspace instead.",
+    request: z.object({ requestId: z.number().int().positive() }),
+    response: z.object({
+      ok: z.literal(true),
+      replaced: z.boolean(),
+      chunk_count: z.number(),
+      total_bytes: z.number(),
+      sha256: z.string(),
+      previous_total_bytes: z.number(),
+    }),
+    privileged: [contracts.filmFileInfo, contracts.readFilmChunk],
+    async handler(
+      ctx,
+      args,
+    ): Promise<{
+      ok: true;
+      replaced: boolean;
+      chunk_count: number;
+      total_bytes: number;
+      sha256: string;
+      previous_total_bytes: number;
+    }> {
+      const db = ctx.db<typeof schema>();
+      const reqRows = await db
+        .select()
+        .from(schema.filmRequests)
+        .where(eq(schema.filmRequests.id, args.requestId))
+        .limit(1);
+      const req = reqRows[0];
+      if (!req) throw new Error("成片请求不存在");
+      const assembly = await loadAssembly(db, req.id);
+      if (!assembly || assembly.status !== "sealed") {
+        throw new Error(
+          "这个请求还没有已封存的成片，没有可替换的版本。首次保存请用 importFilmFromWorkspace",
+        );
+      }
+      const previousTotalBytes = assembly.totalBytes;
+      const info = await ctx.executePrivileged(contracts.filmFileInfo, {
+        requestId: args.requestId,
+      });
+      if (!info.found || info.totalBytes <= 0) {
+        throw new Error(
+          `没有在 ~/workspace/film-delivery/${args.requestId}/delivery.mp4 找到要替换上的成片文件。原已封存的成片没有动。请把新版 MP4 存到这个确切路径（文件夹名就是请求号 ${args.requestId}，文件名必须是 delivery.mp4），用 ffprobe 确认它能完整解码，再调用 replaceFilmFromWorkspace`,
+        );
+      }
+      if (info.totalBytes > FILM_MAX_TOTAL_BYTES) {
+        throw new Error(
+          `新版文件有 ${info.totalBytes} 字节，超过工具能保存的上限（64MB）。原已封存的成片没有动。请保持原分辨率不变、适当调高 CRF 把文件压到 64MB 以内，覆盖 delivery.mp4 后再调用 replaceFilmFromWorkspace`,
+        );
+      }
+      const chunkCount = Math.ceil(info.totalBytes / FILM_CHUNK_BYTES);
+      if (chunkCount > FILM_MAX_CHUNKS) {
+        throw new Error(
+          "新版文件的分片数超过上限（等同超过 64MB）。原已封存的成片没有动。请保持原分辨率不变、适当调高 CRF 把文件压到 64MB 以内后再替换",
+        );
+      }
+      const newSha = info.sha256.toLowerCase();
+      if (
+        newSha === assembly.sha256.toLowerCase() &&
+        info.totalBytes === assembly.totalBytes &&
+        chunkCount === assembly.chunkCount
+      ) {
+        // Byte-identical to the sealed film: nothing to replace.
+        return {
+          ok: true,
+          replaced: false,
+          chunk_count: assembly.chunkCount,
+          total_bytes: assembly.totalBytes,
+          sha256: assembly.sha256,
+          previous_total_bytes: previousTotalBytes,
+        };
+      }
+      // STAGE the new film under versioned blob keys. The sealed
+      // assembly's rows, manifest and blobs are NOT touched in this
+      // phase, so the current film stays playable throughout; any
+      // failure here just discards the staged blobs.
+      const versionTag = newSha.slice(0, 12);
+      const stagedKey = (index: number) =>
+        `${filmChunkBlobKey(assembly.projectId, assembly.requestId, index)}-v${versionTag}`;
+      const staged: { idx: number; blobKey: string; byteLength: number; sha256: string }[] = [];
+      const stagedBytes: Uint8Array[] = [];
+      let stagedFullKey = "";
+      try {
+        for (let i = 0; i < chunkCount; i++) {
+          const part = await ctx.executePrivileged(contracts.readFilmChunk, {
+            requestId: args.requestId,
+            index: i,
+            chunkBytes: FILM_CHUNK_BYTES,
+          });
+          const bytes = decodeBase64(part.dataBase64);
+          if (bytes.length !== part.byteLength || bytes.length === 0) {
+            throw new Error(`第 ${i + 1} 片读取长度异常，原成片没有动。请直接重试 replaceFilmFromWorkspace`);
+          }
+          const actualSha = await sha256Hex(bytes);
+          if (actualSha !== part.sha256.toLowerCase()) {
+            throw new Error(
+              `第 ${i + 1} 片在读取时被打烂了（字节哈希对不上），没有替换，原成片完好。请直接重试 replaceFilmFromWorkspace`,
+            );
+          }
+          if (i === 0) assertMp4ChunkHead(bytes, assembly.mime || "video/mp4");
+          const key = stagedKey(i);
+          await ctx.blobs.put(key, bytes, { contentType: assembly.mime || "video/mp4" });
+          staged.push({ idx: i, blobKey: key, byteLength: bytes.length, sha256: actualSha });
+          stagedBytes.push(bytes);
+        }
+        // Seal-grade verification of the staged set BEFORE the swap:
+        // every staged blob really stored, with exactly the length
+        // its hash-verified bytes had, summing to the file's total.
+        let stagedSum = 0;
+        for (const s of staged) {
+          const head = await ctx.blobs.head(s.blobKey);
+          if (!head || head.sizeBytes !== s.byteLength) {
+            throw new Error(
+              `第 ${s.idx + 1} 片暂存异常（应有 ${s.byteLength} 字节，实际 ${head ? `${head.sizeBytes} 字节` : "不存在"}），没有替换，原成片完好。请直接重试 replaceFilmFromWorkspace`,
+            );
+          }
+          stagedSum += s.byteLength;
+        }
+        if (stagedSum !== info.totalBytes) {
+          throw new Error("暂存分片总长度与新版文件对不上，没有替换，原成片完好。请直接重试 replaceFilmFromWorkspace");
+        }
+        // Stage the whole-file copy too (versioned key): verified
+        // against the new file's whole-file hash before it is stored,
+        // and only pointed at by the atomic swap below.
+        const fullBytes = concatBytes(stagedBytes);
+        if ((await sha256Hex(fullBytes)) !== newSha) {
+          throw new Error("新版成片整文件校验对不上，没有替换，原成片完好。请直接重试 replaceFilmFromWorkspace");
+        }
+        stagedFullKey = filmFullBlobKey(assembly.projectId, assembly.requestId, versionTag);
+        await ctx.blobs.put(stagedFullKey, fullBytes, {
+          contentType: assembly.mime || "video/mp4",
+        });
+        const fullHead = await ctx.blobs.head(stagedFullKey);
+        if (!fullHead || fullHead.sizeBytes !== info.totalBytes) {
+          throw new Error("新版成片整文件暂存异常，没有替换，原成片完好。请直接重试 replaceFilmFromWorkspace");
+        }
+      } catch (e) {
+        for (const s of staged) {
+          try {
+            await ctx.blobs.delete(s.blobKey);
+          } catch {
+            // best-effort cleanup of staged blobs; the sealed film is untouched either way
+          }
+        }
+        if (stagedFullKey) {
+          try {
+            await ctx.blobs.delete(stagedFullKey);
+          } catch {
+            // best-effort cleanup, as above
+          }
+        }
+        throw e;
+      }
+      // Prepare the graph patch (new manifest on the 成片 node) from
+      // the current stored graph, exactly like sealAssembly does.
+      const projRows = await db
+        .select()
+        .from(schema.projects)
+        .where(eq(schema.projects.id, assembly.projectId))
+        .limit(1);
+      const proj = projRows[0];
+      if (!proj) throw new Error("项目不存在，原成片没有动");
+      const marker = filmAssemblyMarker(assembly.requestId);
+      const manifest = {
+        requestId: assembly.requestId,
+        chunkCount,
+        totalBytes: info.totalBytes,
+        sha256: newSha,
+        mime: assembly.mime || "video/mp4",
+      };
+      const graph = parseGraphLike(proj.graph);
+      const targetId = attachFilmToGraph(graph, assembly.packageNodeId || undefined, {
+        url: "",
+        blobKey: "",
+        filmAssembly: manifest,
+      });
+      const oldChunkRows = await db
+        .select()
+        .from(schema.filmChunks)
+        .where(eq(schema.filmChunks.assemblyId, assembly.id));
+      // ATOMIC SWAP: one batch repoints the chunk rows, the assembly
+      // manifest, the project graph and the history at the new
+      // version. Before this batch commits, every reader still sees
+      // the old sealed film; after it, everyone sees the new one.
+      // There is no intermediate state.
+      const statements: BatchItem<"sqlite">[] = [
+        db.delete(schema.filmChunks).where(eq(schema.filmChunks.assemblyId, assembly.id)),
+        ...staged.map((s) =>
+          db.insert(schema.filmChunks).values({
+            assemblyId: assembly.id,
+            idx: s.idx,
+            blobKey: s.blobKey,
+            byteLength: s.byteLength,
+            sha256: s.sha256,
+          }),
+        ),
+        db
+          .update(schema.filmAssemblies)
+          .set({
+            chunkCount,
+            totalBytes: info.totalBytes,
+            sha256: newSha,
+            mime: "video/mp4",
+            fullBlobKey: stagedFullKey || assembly.fullBlobKey,
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.filmAssemblies.id, assembly.id)),
+        db
+          .update(schema.projects)
+          .set({ graph: JSON.stringify(graph), updatedAt: new Date() })
+          .where(eq(schema.projects.id, assembly.projectId)),
+        db.insert(schema.generations).values({
+          projectId: assembly.projectId,
+          kind: "video",
+          prompt: `成片：${proj.name}`,
+          blobKey: marker,
+          nodeId: targetId,
+        }),
+      ];
+      const [firstStmt, ...restStmts] = statements;
+      if (firstStmt) await db.batch([firstStmt, ...restStmts]);
+      await completeFilmRequest(db, {
+        projectId: assembly.projectId,
+        requestId: assembly.requestId,
+        filmRef: marker,
+      });
+      // Cleanup: the old version's blobs are unreferenced now.
+      const newKeys = new Set(staged.map((s) => s.blobKey));
+      for (const row of oldChunkRows) {
+        if (!row.blobKey || newKeys.has(row.blobKey)) continue;
+        try {
+          await ctx.blobs.delete(row.blobKey);
+        } catch {
+          // best-effort: an orphaned old chunk blob is harmless
+        }
+      }
+      if (assembly.fullBlobKey && assembly.fullBlobKey !== stagedFullKey) {
+        try {
+          await ctx.blobs.delete(assembly.fullBlobKey);
+        } catch {
+          // best-effort: an orphaned old whole-file copy is harmless
+        }
+      }
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        replaced: true,
+        chunk_count: chunkCount,
+        total_bytes: info.totalBytes,
+        sha256: newSha,
+        previous_total_bytes: previousTotalBytes,
       };
     },
   }),
@@ -2362,6 +2807,48 @@ export const Actions = {
         mime: assembly.mime || "video/mp4",
         chunk_urls: chunkUrls,
       };
+    },
+  }),
+
+  getFilmFile: defineAction({
+    description:
+      "Returns a direct whole-file URL for a sealed chunked film: one blob holding the complete MP4, so the page downloads or plays it in a single request with no chunk fetches, no browser-side reassembly and no repeat verification (sealing already verified every chunk hash and the whole-file total). If the film was sealed before whole-file copies existed, the copy is materialized once here — verified against the sealed manifest's size + SHA-256 — and reused afterwards. url is empty when no whole-file copy exists or could be produced; the client then falls back to getFilmAssembly's chunked path.",
+    request: z.object({ requestId: z.number().int().positive() }),
+    response: filmFileResponse,
+    privileged: [contracts.filmFileInfo, contracts.readFilmChunk],
+    async handler(ctx, args): Promise<z.infer<typeof filmFileResponse>> {
+      const db = ctx.db<typeof schema>();
+      const assembly = await loadAssembly(db, args.requestId);
+      if (!assembly) {
+        return {
+          found: false,
+          sealed: false,
+          url: "",
+          total_bytes: 0,
+          sha256: "",
+          mime: "video/mp4",
+          chunk_count: 0,
+        };
+      }
+      const base = {
+        found: true,
+        sealed: assembly.status === "sealed",
+        total_bytes: assembly.totalBytes,
+        sha256: assembly.sha256,
+        mime: assembly.mime || "video/mp4",
+        chunk_count: assembly.chunkCount,
+      };
+      if (assembly.status !== "sealed") return { ...base, url: "" };
+      let key = assembly.fullBlobKey;
+      if (key) {
+        const head = await ctx.blobs.head(key);
+        if (!head || head.sizeBytes !== assembly.totalBytes) key = "";
+      }
+      if (!key) {
+        key = await materializeFullFilmBlob(ctx, db, assembly);
+      }
+      if (!key) return { ...base, url: "" };
+      return { ...base, url: await ctx.blobs.getUrl(key) };
     },
   }),
 

@@ -43,6 +43,13 @@
       "when": 1794316432327,
       "tag": "0006_add_film_assemblies_chunked_save",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794383173031,
+      "tag": "0007_add_film_full_blob_key",
+      "breakpoints": true
     }
   ]
 }

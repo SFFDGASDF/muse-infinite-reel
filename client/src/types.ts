@@ -115,6 +115,17 @@ export function nodeHeight(node: CanvasNode): number {
   return 460;
 }
 
+/** Column count for laying N same-kind nodes out as a wrapped grid
+ *  instead of one long vertical strip: roughly √N in cell count,
+ *  biased wider (node cells are taller than they are wide, so a
+ *  square cell grid already reads portrait), capped at 6 across.
+ *  Shared by 整理 auto-layout, storyboard split and (mirrored in)
+ *  the server-side Agent canvas skeleton. */
+export function gridColumnCount(count: number): number {
+  if (count <= 1) return 1;
+  return Math.min(6, Math.max(2, Math.round(Math.sqrt(count * 1.9))));
+}
+
 export function uid(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}${Date.now().toString(36).slice(-3)}`;
 }

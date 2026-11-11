@@ -15,7 +15,7 @@ type ImageToolKind,
 type PackageShotInfo,
 type TextMode,
 } from "./NodeCard";
-import { AssembledFilmPlayer, downloadAssembledFilm } from "./filmAssembly";
+import { DirectFilmDownload, DirectFilmPlayer } from "./filmAssembly";
 import { ImageToolsDialog } from "./ImageTools";
 import {
 NODE_W,
@@ -25,6 +25,7 @@ effectivePrompt,
 effectiveQuality,
 groupMembers,
 groupWrapRect,
+gridColumnCount,
 makeNode,
 nodeHeight,
 nodeWidth,
@@ -145,10 +146,9 @@ export function App() {
   // URLs of history-rail videos that failed to load (same damaged-file
   // class as above); their download links are withdrawn, not dead-ends.
   const [brokenGenUrls, setBrokenGenUrls] = useState<ReadonlySet<string>>(new Set());
-  // History entries (chunked films) whose reassembly verification
-  // failed, and the one currently being assembled for download.
+  // History entries (chunked films) whose fallback reassembly
+  // verification failed; their downloads are withdrawn.
   const [brokenGenIds, setBrokenGenIds] = useState<ReadonlySet<number>>(new Set());
-  const [historyDlId, setHistoryDlId] = useState<number | null>(null);
   // Agent 一句话成片 panel + run state
   const [showAgentPanel, setShowAgentPanel] = useState(false);
   const [agentInstruction, setAgentInstruction] = useState("");
@@ -494,7 +494,6 @@ export function App() {
     ((filmQuery.data?.is_stalled ?? false) ||
       (Number.isFinite(filmUpdatedMs) && filmNow - filmUpdatedMs >= filmStallWarnMs));
   const [filmCancelling, setFilmCancelling] = useState(false);
-  const [bannerDownloading, setBannerDownloading] = useState(false);
 
   useEffect(() => {
     const data = filmQuery.data;
@@ -1129,50 +1128,125 @@ export function App() {
     [selectedIds],
   );
 
-  /** LibTV-style tidy: layer nodes by their wiring (longest path from a
-   *  root), columns left→right, stacked top→bottom inside each column. */
+  /** Tidy: layer nodes by their wiring (longest path from a root),
+   *  layers left→right, and inside each layer lay the nodes out as a
+   *  WRAPPED GRID (row-major, reading order preserved) instead of one
+   *  long vertical strip — a layer of 13 shot nodes becomes a compact
+   *  multi-column block, and the 成片 layer lands to the right of the
+   *  whole block. A group frame and its members form one layout unit:
+   *  the unit is placed by its frame's top-left corner and every
+   *  member keeps its offset inside the frame (groups are never
+   *  split). Locked units keep their place but still occupy their
+   *  grid cell. Finishes with a fit-all so the whole arrangement is
+   *  visible at once. */
   const autoLayout = useCallback(() => {
-    setGraph((g) => {
-      if (g.nodes.length === 0) return g;
-      const layer = new Map<string, number>(g.nodes.map((n) => [n.id, 0]));
-      for (let iter = 0; iter < g.nodes.length; iter++) {
-        let changed = false;
-        for (const e of g.edges) {
-          const from = layer.get(e.from) ?? 0;
-          const to = layer.get(e.to) ?? 0;
-          if (to < from + 1) {
-            layer.set(e.to, from + 1);
-            changed = true;
-          }
+    const g0 = graphRef.current;
+    if (g0.nodes.length === 0) return;
+    const layer = new Map<string, number>(g0.nodes.map((n) => [n.id, 0]));
+    for (let iter = 0; iter < g0.nodes.length; iter++) {
+      let changed = false;
+      for (const e of g0.edges) {
+        const from = layer.get(e.from) ?? 0;
+        const to = layer.get(e.to) ?? 0;
+        if (to < from + 1) {
+          layer.set(e.to, from + 1);
+          changed = true;
         }
-        if (!changed) break;
       }
-      const byLayer = new Map<number, CanvasNode[]>();
-      for (const n of g.nodes) {
-        const l = layer.get(n.id) ?? 0;
-        const arr = byLayer.get(l) ?? [];
-        arr.push(n);
-        byLayer.set(l, arr);
-      }
-      const pos = new Map<string, { x: number; y: number }>();
-      for (const [l, arr] of byLayer) {
-        const sorted = [...arr].sort((a, b) => a.y - b.y || a.x - b.x);
+      if (!changed) break;
+    }
+    interface LayoutUnit {
+      anchor: CanvasNode;
+      members: CanvasNode[];
+      layer: number;
+      w: number;
+      h: number;
+      locked: boolean;
+    }
+    const units: LayoutUnit[] = [];
+    const claimed = new Set<string>();
+    for (const n of g0.nodes) {
+      if (n.type !== "group") continue;
+      const members = g0.nodes.filter((m) => m.groupId === n.id);
+      const all = [n, ...members];
+      for (const m of all) claimed.add(m.id);
+      units.push({
+        anchor: n,
+        members: all,
+        layer:
+          members.length > 0
+            ? Math.min(...members.map((m) => layer.get(m.id) ?? 0))
+            : (layer.get(n.id) ?? 0),
+        w: nodeWidth(n),
+        h: nodeHeight(n),
+        locked: all.some((m) => m.locked),
+      });
+    }
+    for (const n of g0.nodes) {
+      if (claimed.has(n.id)) continue;
+      units.push({
+        anchor: n,
+        members: [n],
+        layer: layer.get(n.id) ?? 0,
+        w: nodeWidth(n),
+        h: nodeHeight(n),
+        locked: n.locked,
+      });
+    }
+    const byLayer = new Map<number, LayoutUnit[]>();
+    for (const u of units) {
+      const arr = byLayer.get(u.layer) ?? [];
+      arr.push(u);
+      byLayer.set(u.layer, arr);
+    }
+    const GAP_X = 56;
+    const GAP_Y = 48;
+    const pos = new Map<string, { x: number; y: number }>();
+    let layerX = 60;
+    for (const l of [...byLayer.keys()].sort((a, b) => a - b)) {
+      const arr = (byLayer.get(l) ?? []).sort(
+        (a, b) => a.anchor.y - b.anchor.y || a.anchor.x - b.anchor.x,
+      );
+      if (arr.length === 0) continue;
+      const cols = gridColumnCount(arr.length);
+      const cellW = Math.max(...arr.map((u) => u.w));
+      // Row tops accumulate each row's tallest unit, so rows of short
+      // text nodes don't inherit the full shot-node height.
+      const rowTops: number[] = [];
+      {
         let y = 60;
-        for (const n of sorted) {
-          if (!n.locked) pos.set(n.id, { x: 60 + l * 380, y });
-          y += nodeHeight(n) + 48;
+        for (let r = 0; r * cols < arr.length; r++) {
+          rowTops.push(y);
+          const rowUnits = arr.slice(r * cols, r * cols + cols);
+          y += Math.max(...rowUnits.map((u) => u.h)) + GAP_Y;
         }
       }
-      return {
-        ...g,
-        nodes: g.nodes.map((n) => {
-          const p = pos.get(n.id);
-          return p ? { ...n, x: p.x, y: p.y } : n;
-        }),
-      };
+      arr.forEach((u, i) => {
+        if (u.locked) return;
+        const ux = layerX + (i % cols) * (cellW + GAP_X);
+        const uy = rowTops[Math.floor(i / cols)] ?? 60;
+        const dx = ux - u.anchor.x;
+        const dy = uy - u.anchor.y;
+        for (const m of u.members) pos.set(m.id, { x: m.x + dx, y: m.y + dy });
+      });
+      layerX += cols * cellW + (cols - 1) * GAP_X + 110;
+    }
+    const laid = g0.nodes.map((n) => {
+      const p = pos.get(n.id);
+      return p ? { ...n, x: p.x, y: p.y } : n;
     });
-    setToast("已按连线顺序整理画布");
-  }, []);
+    setGraph((g) => ({
+      ...g,
+      nodes: g.nodes.map((n) => {
+        const p = pos.get(n.id);
+        return p ? { ...n, x: p.x, y: p.y } : n;
+      }),
+    }));
+    if (laid.length > 0 && containerSize.w > 0 && containerSize.h > 0) {
+      setViewport(fitViewportForNodes(laid, containerSize.w, containerSize.h));
+    }
+    setToast("已按连线顺序整理成网格布局");
+  }, [containerSize, setViewport]);
 
   const completeLink = useCallback(
     (targetId: string) => {
@@ -1337,7 +1411,10 @@ export function App() {
   );
 
   /** Turn a storyboard-script text node into wired shot nodes:
-   *  text → image×N → video, laid out in a row to the right. */
+   *  text → image×N → video. The shots are laid out as a wrapped grid
+   *  to the right of the script (row-major, story order), never one
+   *  long vertical strip; the 成片 node sits right of the grid,
+   *  vertically centered on it. */
   const handleSplitStoryboard = useCallback(
     (node: CanvasNode) => {
       const fresh = graphRef.current.nodes.find((n) => n.id === node.id) ?? node;
@@ -1347,8 +1424,14 @@ export function App() {
         return;
       }
       const baseX = fresh.x + 380;
+      const cols = gridColumnCount(shots.length);
+      const rows = Math.ceil(shots.length / cols);
       const imageNodes: CanvasNode[] = shots.map((s, i) => {
-        const n = makeNode("image", baseX, fresh.y + i * 372);
+        const n = makeNode(
+          "image",
+          baseX + (i % cols) * 380,
+          fresh.y + Math.floor(i / cols) * 372,
+        );
         n.title = `镜头 ${i + 1}`;
         n.text = s.prompt;
         n.caption = s.caption;
@@ -1359,8 +1442,8 @@ export function App() {
       });
       const videoNode = makeNode(
         "video",
-        baseX + 380,
-        fresh.y + ((shots.length - 1) * 372) / 2,
+        baseX + cols * 380,
+        fresh.y + ((rows - 1) * 372) / 2,
       );
       videoNode.title = "成片";
       videoNode.aspect = fresh.aspect;
@@ -2502,7 +2585,29 @@ export function App() {
   // ---- render -------------------------------------------------------------------
 
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-[var(--bg)] text-[var(--text)]">
+    <div
+      className="flex h-[100dvh] flex-col overflow-hidden bg-[var(--bg)] text-[var(--text)]"
+      // Native HTML5 drag must never start anywhere in this app: node
+      // movement is Pointer Events only. Without this, pressing on a
+      // node's <video>, a download <a>, or a history thumbnail and
+      // moving starts a BROWSER drag of the media/link, and dropping
+      // it near the tab strip opens the file in a new browser tab —
+      // which users hit constantly when "dragging a node". The one
+      // exception is text inside editable fields, where drag-and-drop
+      // of selected text is legitimate editing.
+      onDragStart={(e) => {
+        const t = e.target instanceof HTMLElement ? e.target : null;
+        if (t?.closest("input, textarea, select, [contenteditable]")) return;
+        e.preventDefault();
+      }}
+      // Middle-click (auxclick) on a link opens it in a new tab in
+      // desktop browsers; the download links here must never do that.
+      onAuxClick={(e) => {
+        if (e.button !== 1) return;
+        const t = e.target instanceof HTMLElement ? e.target : null;
+        if (t?.closest("a[href]")) e.preventDefault();
+      }}
+    >
       {/* top bar */}
       <header className="z-20 flex flex-wrap items-center gap-2 border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2 pt-safe">
         <button
@@ -2743,6 +2848,7 @@ export function App() {
                 <a
                   href={filmQuery.data.film_url}
                   download="成片.mp4"
+                  draggable={false}
                   className="font-medium text-[var(--cyan)]"
                   aria-label="下载成片"
                 >
@@ -2750,26 +2856,15 @@ export function App() {
                 </a>
               )}
               {filmQuery.data?.film_chunked && filmQuery.data.request_id != null && (
-                <button
-                  type="button"
-                  className="font-medium text-[var(--cyan)] disabled:opacity-50"
-                  aria-label="下载成片"
-                  disabled={bannerDownloading}
-                  onClick={() => {
-                    const reqId = filmQuery.data?.request_id;
-                    if (reqId == null) return;
-                    setBannerDownloading(true);
-                    downloadAssembledFilm(reqId, "成片.mp4")
-                      .catch((e: unknown) =>
-                        setToast(
-                          `下载成片失败：${e instanceof Error ? e.message : String(e)}`,
-                        ),
-                      )
-                      .finally(() => setBannerDownloading(false));
-                  }}
+                <DirectFilmDownload
+                  requestId={filmQuery.data.request_id}
+                  filename="成片.mp4"
+                  className="font-medium text-[var(--cyan)]"
+                  ariaLabel="下载成片"
+                  onError={(message) => setToast(`下载成片失败：${message}`)}
                 >
-                  {bannerDownloading ? "正在拼装校验…" : "下载成片"}
-                </button>
+                  下载成片
+                </DirectFilmDownload>
               )}
             </>
           ) : null}
@@ -4286,7 +4381,7 @@ export function App() {
                     className="overflow-hidden rounded-lg border border-[var(--border)]"
                   >
                     {gen.kind === "image" ? (
-                      <img src={gen.url} alt={gen.prompt || "生成的图片"} className="w-full object-cover" />
+                      <img src={gen.url} alt={gen.prompt || "生成的图片"} className="w-full object-cover" draggable={false} />
                     ) : gen.chunked && gen.film_request_id != null ? (
                       brokenGenIds.has(gen.id) ? (
                         <p role="alert" className="px-2.5 py-3 text-xs leading-snug text-[#ff7a5c]">
@@ -4294,7 +4389,7 @@ export function App() {
                         </p>
                       ) : (
                         <div className="px-2.5 py-2.5">
-                          <AssembledFilmPlayer
+                          <DirectFilmPlayer
                             assembly={{
                               requestId: gen.film_request_id,
                               chunkCount: 0,
@@ -4319,6 +4414,7 @@ export function App() {
                         src={gen.url}
                         controls
                         playsInline
+                        draggable={false}
                         className="w-full"
                         onError={() =>
                           setBrokenGenUrls((prev) => new Set(prev).add(gen.url))
@@ -4354,32 +4450,24 @@ export function App() {
                           </button>
                           {gen.kind === "video" && brokenGenUrls.has(gen.url) ? null : gen.chunked ? (
                             brokenGenIds.has(gen.id) || gen.film_request_id == null ? null : (
-                              <button
-                                type="button"
-                                className="text-[11px] text-[var(--cyan)] disabled:opacity-50"
-                                aria-label="下载该生成结果"
-                                disabled={historyDlId === gen.id}
-                                onClick={() => {
-                                  const reqId = gen.film_request_id;
-                                  if (reqId == null) return;
-                                  setHistoryDlId(gen.id);
-                                  downloadAssembledFilm(reqId, "成片.mp4")
-                                    .catch((e: unknown) => {
-                                      setBrokenGenIds((prev) => new Set(prev).add(gen.id));
-                                      setToast(
-                                        `下载失败：${e instanceof Error ? e.message : String(e)}`,
-                                      );
-                                    })
-                                    .finally(() => setHistoryDlId(null));
+                              <DirectFilmDownload
+                                requestId={gen.film_request_id}
+                                filename="成片.mp4"
+                                className="text-[11px] text-[var(--cyan)]"
+                                ariaLabel="下载该生成结果"
+                                onError={(message) => {
+                                  setBrokenGenIds((prev) => new Set(prev).add(gen.id));
+                                  setToast(`下载失败：${message}`);
                                 }}
                               >
-                                {historyDlId === gen.id ? "拼装中…" : "下载"}
-                              </button>
+                                下载
+                              </DirectFilmDownload>
                             )
                           ) : (
                             <a
                               href={gen.url}
                               download
+                              draggable={false}
                               className="text-[11px] text-[var(--cyan)]"
                               aria-label="下载该生成结果"
                             >
